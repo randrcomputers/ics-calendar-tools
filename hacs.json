@@ -1,5 +1,6 @@
 {
   "name": "ICS Calendar Tools",
   "content_in_root": false,
-  "render_readme": true
+  "render_readme": true,
+  "domains": ["ics_calendar_tools"]
 }
