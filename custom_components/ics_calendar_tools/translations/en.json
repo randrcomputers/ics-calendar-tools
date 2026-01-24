@@ -1,0 +1,14 @@
+{
+  "title": "ICS Calendar Tools",
+  "config": {
+    "step": {
+      "user": {
+        "title": "ICS Calendar Tools",
+        "description": "Registers services to delete and update events in Local Calendar (.ics) calendars."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one instance is needed."
+    }
+  }
+}
