@@ -1,7 +1,42 @@
-# ICS Calendar Tools
+# ICS Calendar Tools (Home Assistant)
 
-Custom integration that edits local `.ics` calendar files via services.
+**ICS Calendar Tools** is a Home Assistant custom integration that lets you **add, edit, and delete events** in **Local Calendar (.ics)** calendars by writing directly to the calendar’s `.ics` file and then reloading Local Calendar so changes appear immediately.
 
-Folder: `custom_components/ics_calendar_tools/`
+This was built to work well with dashboards like **Week Planner Card Plus** (Skylight-style family calendar dashboards).
 
-After installing, restart Home Assistant (or reload the integration if supported).
+---
+
+## Features
+
+- ✅ Add events to a Local Calendar (`.ics`)
+- ✅ Edit events (update title/time/details)
+- ✅ Delete events reliably (UID-based when available)
+- ✅ Refreshes Local Calendar after changes (no manual restart required)
+- ✅ Works with multiple Local Calendar entities
+
+---
+
+## Requirements
+
+- Home Assistant with **Local Calendar** configured.
+- A calendar entity created by Local Calendar (e.g. `calendar.family_calendar`).
+
+---
+
+## Installation (HACS)
+
+1. Open **HACS** → **Integrations**
+2. Click the 3 dots (top right) → **Custom repositories**
+3. Add this repository URL and select category **Integration**
+4. Install **ICS Calendar Tools**
+5. Restart Home Assistant
+
+> After restart, you should see the integration’s services available under Developer Tools → Services.
+
+---
+
+## Installation (Manual)
+
+Copy the folder:
+
+
