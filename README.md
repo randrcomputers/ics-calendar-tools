@@ -27,16 +27,17 @@ This was built to work well with dashboards like **Week Planner Card Plus** (Sky
 
 1. Open **HACS** → **Integrations**
 2. Click the 3 dots (top right) → **Custom repositories**
-3. Add this repository URL and select category **Integration**
+3. Add this repository URL "https://github.com/randrcomputers/ics-calendar-tools.git" and select category **Integration**
 4. Install **ICS Calendar Tools**
 5. Restart Home Assistant
+6. install ics calendar tools from Devices and services Add integration "ics Calendar Tools"
 
-> After restart, you should see the integration’s services available under Developer Tools → Services.
 
----
+> After that, you should see the integration’s services available under Developer Tools → Services.
+> ics_calendar_tools.delete_event
+> ics_calendar_tools.update_event
 
-## Installation (Manual)
 
-Copy the folder:
+
 
 
