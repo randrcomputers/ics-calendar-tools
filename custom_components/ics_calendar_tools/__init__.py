@@ -380,99 +380,162 @@ def _register_services(hass: HomeAssistant) -> None:
             create_data["start_date_time"] = _to_dt(start_s).strftime("%Y-%m-%d %H:%M:%S")
             create_data["end_date_time"] = _to_dt(end_s).strftime("%Y-%m-%d %H:%M:%S")
 
-        await hass.services.async_call("calendar", "create_event", create_data, blocking=True)
+        # Create the base event.
+rrule_val = ""
+try:
+    rrule_val = str(rrule_s).strip() if (rrule_s is not None and str(rrule_s).strip()) else ""
+except Exception:
+    rrule_val = ""
 
-        # If no RRULE requested, we are done.
-        if not (rrule_s is not None and str(rrule_s).strip()):
-            try:
-                await hass.services.async_call(
-                    "homeassistant",
-                    "update_entity",
-                    {"entity_id": cal_ent},
-                    blocking=True,
-                )
-            except Exception:
-                pass
-            return
+# Best effort: for calendars where calendar.get_events does NOT expose UID (e.g. some providers),
+# we try to force a known UID at create-time so we can apply RRULE immediately after.
+forced_uid = str(uuid.uuid4()) if rrule_val else None
 
-        # Best-effort: fetch the newly created event UID, then update with RRULE.
-        uid = None
+async def _create_base_event() -> None:
+    # Prefer calling the CalendarEntity method directly so we can pass uid even if the service schema
+    # doesn't allow it in this HA version.
+    comp = hass.data.get("calendar")
+    ent = None
+    if comp is not None and hasattr(comp, "get_entity"):
         try:
-            # Query a narrow window around the new event.
-            if all_day:
-                win_start = _to_dt(f"{_to_date(start_s).isoformat()}T00:00:00")
-                win_end = _to_dt(f"{_to_date(end_s).isoformat()}T23:59:59")
-            else:
-                win_start = _to_dt(start_s) - timedelta(minutes=2)
-                win_end = _to_dt(end_s) + timedelta(minutes=2)
+            ent = comp.get_entity(cal_ent)
+        except Exception:
+            ent = None
 
-            resp = await hass.services.async_call(
-                "calendar",
-                "get_events",
-                {
-                    "entity_id": cal_ent,
-                    "start_date_time": win_start.isoformat(),
-                    "end_date_time": win_end.isoformat(),
-                },
-                blocking=True,
-                return_response=True,
-            )
+    kwargs = dict(create_data)
+    if forced_uid:
+        kwargs["uid"] = forced_uid
 
-            events = None
-            if isinstance(resp, dict):
-                if "events" in resp:
-                    events = resp.get("events")
-                elif cal_ent in resp and isinstance(resp.get(cal_ent), dict):
-                    events = resp.get(cal_ent, {}).get("events")
-            if events is None:
-                _LOGGER.debug("ICS_CALENDAR_TOOLS add_event get_events response had no 'events': %s", resp)
-
-            def _norm(s: Any) -> str:
-                return (str(s).strip() if s is not None else "")
-
-            def _same_start(ev: dict) -> bool:
-                # HA event start can be "date" or "dateTime" depending on all_day
-                st = ev.get("start") or {}
-                if all_day:
-                    return _norm(st.get("date")) == _to_date(start_s).isoformat()
-                return _norm(st.get("dateTime"))[:19] == _to_dt(start_s).isoformat()[:19]
-
-            if isinstance(events, list):
-                for ev in events:
-                    if not isinstance(ev, dict):
-                        continue
-                    if _norm(ev.get("summary")) != _norm(summary):
-                        continue
-                    if not _same_start(ev):
-                        continue
-                    uid = ev.get("uid") or ev.get("id")
-                    if uid:
-                        break
+    if ent is not None and hasattr(ent, "async_create_event"):
+        try:
+            await ent.async_create_event(**kwargs)
+            return
         except TypeError:
-            _LOGGER.warning("ICS_CALENDAR_TOOLS add_event: return_response not supported on this HA version; cannot set RRULE on non-local calendars.")
-        except Exception as e:
-            _LOGGER.warning("ICS_CALENDAR_TOOLS add_event: failed to locate newly created event UID for RRULE update: %s", e)
+            # Some implementations may not accept uid at create-time.
+            if forced_uid:
+                kwargs = dict(create_data)
+                await ent.async_create_event(**kwargs)
+                return
+            raise
 
-        if not uid:
-            raise ValueError(
-                "Created the base event, but could not retrieve its UID to apply RRULE. "
-                "This HA version/integration may not expose UID via calendar.get_events."
-            )
+    # Fallback to the service call
+    try:
+        await hass.services.async_call("calendar", "create_event", kwargs, blocking=True)
+    except Exception:
+        # If uid is rejected by service validation, retry without it.
+        if forced_uid:
+            await hass.services.async_call("calendar", "create_event", dict(create_data), blocking=True)
+            return
+        raise
 
-        # Apply RRULE using calendar.update_event (works for providers that support recurrence, e.g. Google).
+await _create_base_event()
+
+# If no RRULE requested, we are done.
+if not rrule_val:
+    try:
         await hass.services.async_call(
-            "calendar",
-            "update_event",
-            {
-                "entity_id": cal_ent,
-                "uid": uid,
-                "rrule": str(rrule_s).strip(),
-            },
+            "homeassistant",
+            "update_entity",
+            {"entity_id": cal_ent},
             blocking=True,
         )
+    except Exception:
+        pass
+    return
 
-        try:
+# RRULE requested: apply recurrence.
+uid = forced_uid
+
+# Try applying RRULE with the forced UID first (works when create-time uid is honored).
+try:
+    await hass.services.async_call(
+        "calendar",
+        "update_event",
+        {
+            "entity_id": cal_ent,
+            "uid": uid,
+            "rrule": rrule_val,
+        },
+        blocking=True,
+    )
+except Exception as e:
+    _LOGGER.warning(
+        "ICS_CALENDAR_TOOLS add_event: update_event with forced uid failed (%s). Falling back to UID lookup via calendar.get_events.",
+        e,
+    )
+    uid = None
+
+if not uid:
+    # Fallback: attempt to locate UID via calendar.get_events (note: some providers do NOT expose UID here).
+    try:
+        start_dt = _to_dt(start_s)
+        end_dt = _to_dt(end_s)
+        range_start = (start_dt - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        range_end = (end_dt + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+
+        resp = await hass.services.async_call(
+            "calendar",
+            "get_events",
+            {
+                "entity_id": cal_ent,
+                "start_date_time": range_start,
+                "end_date_time": range_end,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+        events = []
+        if isinstance(resp, dict):
+            events = resp.get(cal_ent) or resp.get("events") or []
+        if isinstance(events, dict):
+            events = list(events.values())
+
+        want_summary = str(summary or "").strip()
+        want_start = _to_dt(start_s)
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                continue
+            ev_sum = str(ev.get("summary") or "").strip()
+            ev_start = ev.get("start")
+            ev_uid = ev.get("uid") or ev.get("id")
+            try:
+                ev_start_dt = _to_dt(ev_start)
+            except Exception:
+                continue
+            if want_summary and ev_sum != want_summary:
+                continue
+            if abs((ev_start_dt - want_start).total_seconds()) <= 120:
+                uid = ev_uid
+                break
+
+        # As a last resort, pick the first event in the time window.
+        if not uid and events:
+            first = events[0]
+            if isinstance(first, dict):
+                uid = first.get("uid") or first.get("id")
+
+        if uid:
             await hass.services.async_call(
+                "calendar",
+                "update_event",
+                {
+                    "entity_id": cal_ent,
+                    "uid": uid,
+                    "rrule": rrule_val,
+                },
+                blocking=True,
+            )
+    except Exception as e:
+        _LOGGER.warning("ICS_CALENDAR_TOOLS add_event: failed to locate newly created event UID for RRULE update: %s", e)
+
+if not uid:
+    raise ValueError(
+        "Created the base event, but could not retrieve its UID to apply RRULE. "
+        "This HA version/integration may not expose UID via calendar.get_events."
+    )
+
+await hass.services.async_call(
                 "homeassistant",
                 "update_entity",
                 {"entity_id": cal_ent},
