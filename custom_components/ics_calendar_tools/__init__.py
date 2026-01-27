@@ -5,7 +5,8 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, date
 from typing import Any, Mapping
 
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -24,6 +25,18 @@ def _to_dt(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
     return dt
+
+def _to_date(value: str) -> date:
+    d = dt_util.parse_date(value)
+    if d is not None:
+        return d
+    dt = dt_util.parse_datetime(value)
+    if dt is not None:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+        return dt_util.as_local(dt).date()
+    raise ValueError(f"Invalid date: {value}")
+
 
 
 def _find_ics_path_for_calendar(hass: HomeAssistant, calendar_entity_id: str) -> str:
@@ -290,6 +303,108 @@ def _register_services(hass: HomeAssistant) -> None:
         return
     data["_services_registered"] = True
 
+
+    async def handle_add(call: ServiceCall) -> None:
+        cal_ent = call.data["calendar"]
+        _LOGGER.debug("ICS_CALENDAR_TOOLS add_event call data=%s", dict(call.data))
+
+        summary = call.data.get("summary")
+        if not summary:
+            raise ValueError("Add requires 'summary'.")
+
+        all_day = bool(call.data.get("all_day", False))
+        start_s = call.data.get("start")
+        end_s = call.data.get("end")
+        if not start_s or not end_s:
+            raise ValueError("Add requires 'start' and 'end'.")
+
+        location = call.data.get("location")
+        description = call.data.get("description")
+        rrule_s = call.data.get("rrule")
+        uid = _uid_from_call_data(call.data) or call.data.get("uid") or str(uuid.uuid4())
+
+        # Local calendar path; if not local_calendar, we can only create a single non-repeating event via HA service.
+        try:
+            path = _find_ics_path_for_calendar(hass, cal_ent)
+        except Exception:
+            if rrule_s:
+                raise ValueError("This calendar is not a Local Calendar (.ics); cannot create RRULE recurring series here.")
+            # Best-effort: create a single event via HA calendar service.
+            data = {"summary": summary}
+            if description is not None:
+                data["description"] = description
+            if location is not None:
+                data["location"] = location
+
+            if all_day:
+                data["start_date"] = start_s
+                data["end_date"] = end_s
+            else:
+                data["start_date_time"] = start_s
+                data["end_date_time"] = end_s
+
+            await hass.services.async_call(
+                "calendar",
+                "create_event",
+                {"entity_id": cal_ent, **data},
+                blocking=True,
+            )
+            try:
+                await hass.services.async_call(
+                    "homeassistant",
+                    "update_entity",
+                    {"entity_id": cal_ent},
+                    blocking=True,
+                )
+            except Exception:
+                pass
+            return
+
+        before_mtime = None
+        try:
+            before_mtime = os.path.getmtime(path)
+        except Exception:
+            pass
+
+        cal = await hass.async_add_executor_job(_load_icalendar, path)
+
+        from icalendar import Event, vRecur
+
+        ev = Event()
+        ev.add("uid", str(uid).strip())
+        ev.add("dtstamp", dt_util.utcnow())
+        ev.add("summary", summary)
+
+        if description is not None:
+            ev.add("description", description)
+        if location is not None:
+            ev.add("location", location)
+
+        if all_day:
+            s_d = _to_date(start_s)
+            e_d = _to_date(end_s)
+            # DTEND is exclusive for all-day events; ensure at least 1 day.
+            if e_d <= s_d:
+                e_d = s_d + timedelta(days=1)
+            ev.add("dtstart", s_d)
+            ev.add("dtend", e_d)
+        else:
+            s_dt = _to_dt(start_s)
+            e_dt = _to_dt(end_s)
+            if e_dt <= s_dt:
+                e_dt = s_dt + timedelta(seconds=1)
+            ev.add("dtstart", s_dt)
+            ev.add("dtend", e_dt)
+
+        if rrule_s:
+            # Pass RRULE like "FREQ=DAILY;INTERVAL=1;UNTIL=20260729"
+            ev["RRULE"] = vRecur.from_ical(str(rrule_s).strip())
+
+        cal.add_component(ev)
+
+        await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
+        await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
+
     async def handle_delete(call: ServiceCall) -> None:
         cal_ent = call.data["calendar"]
         _LOGGER.debug("ICS_CALENDAR_TOOLS delete_event call data=%s", dict(call.data))
@@ -381,6 +496,7 @@ def _register_services(hass: HomeAssistant) -> None:
         new_end_s = call.data.get("end")
         new_loc = call.data.get("location")
         new_desc = call.data.get("description")
+        new_rrule = call.data.get("rrule")
 
         new_start = _to_dt(new_start_s) if new_start_s else None
         new_end = _to_dt(new_end_s) if new_end_s else None
@@ -424,6 +540,16 @@ def _register_services(hass: HomeAssistant) -> None:
             if new_desc is not None:
                 comp["DESCRIPTION"] = new_desc
 
+
+            if new_rrule is not None:
+                from icalendar import vRecur
+                r = str(new_rrule).strip()
+                if r == "" or r.lower() in ("none", "null"):
+                    if comp.get("RRULE") is not None:
+                        del comp["RRULE"]
+                else:
+                    comp["RRULE"] = vRecur.from_ical(r)
+
             updated += 1
 
         if updated == 0:
@@ -432,6 +558,7 @@ def _register_services(hass: HomeAssistant) -> None:
         await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
         await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
 
+    hass.services.async_register(DOMAIN, "add_event", handle_add)
     hass.services.async_register(DOMAIN, "delete_event", handle_delete)
     hass.services.async_register(DOMAIN, "update_event", handle_update)
 
