@@ -1,43 +1,93 @@
+add_event:
+  name: Add event (Local Calendar .ics, and best-effort for other calendars)
+  fields:
+    calendar:
+      name: Calendar entity_id
+      example: "calendar.family"
+      required: true
+      selector:
+        entity:
+          domain: calendar
+    summary:
+      name: Summary
+      required: true
+      selector:
+        text: {}
+    description:
+      name: Description
+      required: false
+      selector:
+        text: {}
+    location:
+      name: Location
+      required: false
+      selector:
+        text: {}
+    all_day:
+      name: All day event
+      required: false
+      selector:
+        boolean: {}
+    start:
+      name: Start (date or datetime)
+      example: "2026-01-31"
+      required: true
+      selector:
+        text: {}
+    end:
+      name: End (date or datetime)
+      example: "2026-02-01"
+      required: true
+      selector:
+        text: {}
+    rrule:
+      name: RRULE (RFC5545, optional)
+      example: "FREQ=WEEKLY;INTERVAL=1;UNTIL=20260729"
+      required: false
+      selector:
+        text: {}
+
 delete_event:
   name: Delete event from Local Calendar .ics
   fields:
     calendar:
       name: Calendar entity_id
-      example: calendar.family
+      example: "calendar.family"
       required: true
       selector:
         entity:
           domain: calendar
     uid:
       name: UID (preferred)
-      example: 1234567890@homeassistant
+      example: "1234567890@homeassistant"
       required: false
       selector:
         text: {}
     summary:
       name: Summary (fallback match)
-      example: Trash Day
+      example: "Trash Day"
       required: false
       selector:
         text: {}
     start:
       name: Start ISO time (fallback match)
-      example: '2026-01-21T07:00:00'
+      example: "2026-01-21T07:00:00"
       required: false
       selector:
         text: {}
     end:
       name: End ISO time (fallback match)
-      example: '2026-01-21T07:15:00'
+      example: "2026-01-21T07:15:00"
       required: false
       selector:
         text: {}
+
 update_event:
   name: Update event in Local Calendar .ics
   fields:
     calendar:
       name: Calendar entity_id
-      example: calendar.family
+      example: "calendar.family"
       required: true
       selector:
         entity:
@@ -69,60 +119,6 @@ update_event:
         text: {}
     description:
       name: New Description
-      required: false
-      selector:
-        text: {}
-add_event:
-  name: Add event to Local Calendar .ics (supports RRULE)
-  fields:
-    calendar:
-      name: Calendar entity_id
-      example: calendar.family
-      required: true
-      selector:
-        entity:
-          domain: calendar
-    summary:
-      name: Summary
-      example: Trash Day
-      required: true
-      selector:
-        text: {}
-    start:
-      name: Start (ISO datetime or YYYY-MM-DD)
-      example: '2026-01-28T07:00:00'
-      required: true
-      selector:
-        text: {}
-    end:
-      name: End (ISO datetime or YYYY-MM-DD)
-      example: '2026-01-28T07:15:00'
-      required: true
-      selector:
-        text: {}
-    all_day:
-      name: All-day event
-      example: false
-      required: false
-      selector:
-        boolean: {}
-    location:
-      name: Location
-      required: false
-      selector:
-        text: {}
-    description:
-      name: Description
-      required: false
-      selector:
-        text: {}
-    rrule:
-      name: RRULE (e.g. FREQ=DAILY;INTERVAL=1;UNTIL=20260729)
-      required: false
-      selector:
-        text: {}
-    uid:
-      name: UID (optional; auto-generated if omitted)
       required: false
       selector:
         text: {}
