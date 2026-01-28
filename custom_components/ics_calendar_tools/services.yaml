@@ -73,8 +73,42 @@ update_event:
       required: false
       selector:
         text: {}
-    rrule:
-      name: RRULE body (e.g. `FREQ=DAILY;INTERVAL=1;UNTIL=...`)
+
+add_event:
+  name: Add event to Local Calendar .ics
+  description: Add an event (optionally repeating via RRULE) to a Local Calendar .ics file.
+  fields:
+    calendar:
+      required: true
+      selector:
+        entity:
+          domain: calendar
+    summary:
+      required: true
+      selector:
+        text:
+    description:
       required: false
       selector:
-        text: {}
+        text:
+          multiline: true
+    location:
+      required: false
+      selector:
+        text:
+    all_day:
+      required: true
+      selector:
+        boolean:
+    start:
+      required: true
+      selector:
+        text:
+    end:
+      required: true
+      selector:
+        text:
+    rrule:
+      required: false
+      selector:
+        text:
