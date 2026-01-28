@@ -5,7 +5,6 @@ import logging
 import os
 import shutil
 import tempfile
-import uuid
 from datetime import datetime, timedelta
 from typing import Any, Mapping
 
@@ -292,103 +291,72 @@ def _register_services(hass: HomeAssistant) -> None:
     data["_services_registered"] = True
 
 
-    def _is_local_calendar_entity(calendar_entity_id: str) -> bool:
-        """Return True if this calendar entity is backed by Local Calendar (.ics)."""
-        ent_reg = er.async_get(hass)
-        entry = ent_reg.async_get(calendar_entity_id)
-        if entry is not None and getattr(entry, "platform", None):
-            if entry.platform == "local_calendar":
-                return True
-            # If entity is from some other integration (e.g., google), don't try to map to a local .ics file.
-            return False
-
-        # Fallback: if the expected local_calendar.<slug>.ics exists, treat as local.
-        slug = calendar_entity_id.split(".", 1)[1]
-        return os.path.exists(f"/config/.storage/local_calendar.{slug}.ics")
-
     async def handle_add(call: ServiceCall) -> None:
-        cal_ent = call.data["calendar"]
-        _LOGGER.debug("ICS_CALENDAR_TOOLS add_event call data=%s", dict(call.data))
+        from icalendar import Event, vRecur
 
-        summary = call.data.get("summary") or ""
-        description = call.data.get("description")
-        location = call.data.get("location")
+        cal_ent = call.data.get("calendar")
+        if not cal_ent:
+            raise ValueError("calendar is required")
+
+        summary = (call.data.get("summary") or "").strip()
+        if not summary:
+            raise ValueError("summary is required")
+
+        desc = call.data.get("description")
+        loc = call.data.get("location")
         all_day = bool(call.data.get("all_day", False))
-        start_s = call.data.get("start")
-        end_s = call.data.get("end")
-        rrule = call.data.get("rrule")
+        start_raw = (call.data.get("start") or "").strip()
+        end_raw = (call.data.get("end") or "").strip()
+        rrule_raw = (call.data.get("rrule") or "").strip()
 
-        if not start_s or not end_s:
-            raise ValueError("add_event requires start and end.")
+        if not start_raw or not end_raw:
+            raise ValueError("start and end are required")
 
-        # Non-local calendars: delegate to HA's calendar.create_event (supports mutation-capable calendars).
-        if not _is_local_calendar_entity(cal_ent):
-            svc_data: dict[str, Any] = {"entity_id": cal_ent, "summary": summary}
-            if description is not None:
-                svc_data["description"] = description
-            if location is not None:
-                svc_data["location"] = location
-
-            if all_day:
-                svc_data["start_date"] = str(start_s)
-                svc_data["end_date"] = str(end_s)
-            else:
-                # Allow either ISO or 'YYYY-MM-DD HH:MM:SS' strings; HA will parse.
-                svc_data["start_date_time"] = str(start_s)
-                svc_data["end_date_time"] = str(end_s)
-
-            # Pass through RFC5545 fields when provided (newer HA mutations support RRULE).
-            if rrule:
-                svc_data["rrule"] = str(rrule).strip()
-
-            await hass.services.async_call("calendar", "create_event", svc_data, blocking=True)
-            return
-
-        # Local Calendar (.ics) calendars: edit the underlying file directly.
         path = _find_ics_path_for_calendar(hass, cal_ent)
-        before_mtime = None
+
+        # load calendar
         try:
             before_mtime = os.path.getmtime(path)
         except Exception:
-            pass
+            before_mtime = None
 
         cal = await hass.async_add_executor_job(_load_icalendar, path)
 
-        from icalendar import Event
-
         ev = Event()
-        ev.add("uid", str(uuid.uuid4()))
-        ev.add("dtstamp", dt_util.utcnow())
-
+        # Unique UID (stable enough for local .ics)
+        uid = f"{dt_util.utcnow().strftime('%Y%m%dT%H%M%SZ')}-{os.urandom(4).hex()}@homeassistant"
+        ev.add("uid", uid)
         ev.add("summary", summary)
-        if description is not None:
-            ev.add("description", description)
-        if location is not None:
-            ev.add("location", location)
+
+        if desc:
+            ev.add("description", str(desc))
+        if loc:
+            ev.add("location", str(loc))
 
         if all_day:
-            # DTSTART/DTEND as date. Local calendar expects end_date to be the day after the last all-day date.
-            d_start = dt_util.parse_date(str(start_s))
-            d_end = dt_util.parse_date(str(end_s))
-            if d_start is None or d_end is None:
-                raise ValueError("Invalid start/end date for all_day event.")
-            ev.add("dtstart", d_start)
-            ev.add("dtend", d_end)
+            # Accept YYYY-MM-DD (or ISO date) for all-day
+            sdt = dt_util.parse_date(start_raw) or _to_dt(start_raw).date()
+            edt = dt_util.parse_date(end_raw) or _to_dt(end_raw).date()
+            ev.add("dtstart", sdt)
+            ev.add("dtend", edt)
         else:
-            dt_start = _to_dt(str(start_s))
-            dt_end = _to_dt(str(end_s))
-            ev.add("dtstart", dt_start)
-            ev.add("dtend", dt_end)
+            # Accept ISO or "YYYY-MM-DD HH:MM:SS"
+            sdt = _to_dt(start_raw.replace(" ", "T"))
+            edt = _to_dt(end_raw.replace(" ", "T"))
+            ev.add("dtstart", sdt)
+            ev.add("dtend", edt)
 
-        if rrule:
+        if rrule_raw:
+            # Accept either "RRULE:FREQ=..." or just "FREQ=..."
+            if rrule_raw.upper().startswith("RRULE:"):
+                rrule_raw = rrule_raw.split(":", 1)[1].strip()
             try:
-                from icalendar import vRecur
-                ev.add("rrule", vRecur.from_ical(str(rrule).strip()))
-            except Exception:
-                # Fallback: store as raw string if parsing fails
-                ev["RRULE"] = str(rrule).strip()
+                ev.add("rrule", vRecur.from_ical(rrule_raw))
+            except Exception as e:
+                raise ValueError(f"Invalid RRULE: {rrule_raw}") from e
 
         cal.add_component(ev)
+
         await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
         await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
 

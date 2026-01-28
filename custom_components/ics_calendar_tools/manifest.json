@@ -1,7 +1,7 @@
 {
   "domain": "ics_calendar_tools",
-  "name": "ICS Calendar Tools (Local Calendar + RRULE add)",
-  "version": "1.2.3",
+  "name": "ICS Calendar Tools (Local Calendar Edit Support)",
+  "version": "1.2.0",
   "documentation": "https://github.com/randrcomputers/ics-calendar-tools",
   "issue_tracker": "https://github.com/randrcomputers/ics-calendar-tools/issues",
   "dependencies": [],
