@@ -1,5 +1,5 @@
 add_event:
-  name: Add event (Local Calendar .ics, and best-effort for other calendars)
+  name: Add event (supports RRULE) to a calendar
   fields:
     calendar:
       name: Calendar entity_id
@@ -9,7 +9,7 @@ add_event:
         entity:
           domain: calendar
     summary:
-      name: Summary
+      name: Summary / Title
       required: true
       selector:
         text: {}
@@ -24,25 +24,22 @@ add_event:
       selector:
         text: {}
     all_day:
-      name: All day event
+      name: All day
       required: false
       selector:
         boolean: {}
     start:
-      name: Start (date or datetime)
-      example: "2026-01-31"
+      name: Start (date or datetime string)
       required: true
       selector:
         text: {}
     end:
-      name: End (date or datetime)
-      example: "2026-02-01"
+      name: End (date or datetime string)
       required: true
       selector:
         text: {}
     rrule:
-      name: RRULE (RFC5545, optional)
-      example: "FREQ=WEEKLY;INTERVAL=1;UNTIL=20260729"
+      name: RRULE (e.g. FREQ=DAILY;INTERVAL=1;UNTIL=20260218T235959Z)
       required: false
       selector:
         text: {}
