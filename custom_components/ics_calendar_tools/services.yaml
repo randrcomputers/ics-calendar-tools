@@ -1,9 +1,9 @@
 add_event:
-  name: Add event (Local Calendar .ics, and best-effort for other calendars)
+  name: Add event
+  description: Add an event (Local Calendar via .ics write; other calendars via HA calendar services). Supports RRULE.
   fields:
     calendar:
-      name: Calendar entity_id
-      example: "calendar.family"
+      name: Calendar
       required: true
       selector:
         entity:
@@ -12,40 +12,39 @@ add_event:
       name: Summary
       required: true
       selector:
-        text: {}
+        text:
     description:
       name: Description
       required: false
       selector:
-        text: {}
+        text:
+          multiline: true
     location:
       name: Location
       required: false
       selector:
-        text: {}
+        text:
     all_day:
-      name: All day event
-      required: false
+      name: All day
+      required: true
       selector:
-        boolean: {}
+        boolean:
     start:
-      name: Start (date or datetime)
-      example: "2026-01-31"
+      name: Start
       required: true
       selector:
-        text: {}
+        text:
     end:
-      name: End (date or datetime)
-      example: "2026-02-01"
+      name: End
       required: true
       selector:
-        text: {}
+        text:
     rrule:
-      name: RRULE (RFC5545, optional)
-      example: "FREQ=WEEKLY;INTERVAL=1;UNTIL=20260729"
+      name: RRULE
       required: false
       selector:
-        text: {}
+        text:
+
 
 delete_event:
   name: Delete event from Local Calendar .ics

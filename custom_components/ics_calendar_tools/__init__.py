@@ -6,7 +6,7 @@ import os
 import shutil
 import tempfile
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -18,17 +18,6 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
-def _to_date(value: str) -> date:
-    d = dt_util.parse_date(value)
-    if d is None:
-        dt = dt_util.parse_datetime(value)
-        if dt is not None:
-            d = dt.date()
-    if d is None:
-        raise ValueError(f"Invalid date: {value}")
-    return d
-
-
 def _to_dt(value: str) -> datetime:
     dt = dt_util.parse_datetime(value)
     if dt is None:
@@ -38,16 +27,24 @@ def _to_dt(value: str) -> datetime:
     return dt
 
 
+
+def _to_date(value: str):
+    d = dt_util.parse_date(value)
+    if d is None:
+        raise ValueError(f"Invalid date: {value}")
+    return d
+
+def _local_ics_path_or_none(calendar_entity_id: str) -> str | None:
+    """Return local_calendar .ics path if it exists for this entity_id, else None."""
+    slug = calendar_entity_id.split(".", 1)[1]
+    path = f"/config/.storage/local_calendar.{slug}.ics"
+    return path if os.path.exists(path) else None
+
 def _find_ics_path_for_calendar(hass: HomeAssistant, calendar_entity_id: str) -> str:
     """Map calendar entity_id -> local_calendar .ics path (exact match only).
 
     Local Calendar stores files like:
       /config/.storage/local_calendar.<slug>.ics
-
-    IMPORTANT:
-      - We intentionally do NOT use any name-based fallback. That fallback can
-        accidentally map a non-local calendar entity (e.g., Google) to a local
-        .ics file with the same display name.
     """
     slug = calendar_entity_id.split(".", 1)[1]
     path = f"/config/.storage/local_calendar.{slug}.ics"
@@ -55,18 +52,8 @@ def _find_ics_path_for_calendar(hass: HomeAssistant, calendar_entity_id: str) ->
         return path
 
     raise FileNotFoundError(
-        f"Could not find Local Calendar .ics for {calendar_entity_id}. "
-        f"Tried: {path}. (No name-based fallback is used.)"
+        f"Could not find .ics file for {calendar_entity_id}. Tried {path}."
     )
-
-def _local_ics_path_or_none(calendar_entity_id: str) -> str | None:
-    """Return Local Calendar .ics path if it exists for this entity_id."""
-    try:
-        slug = calendar_entity_id.split(".", 1)[1]
-    except Exception:
-        return None
-    path = f"/config/.storage/local_calendar.{slug}.ics"
-    return path if os.path.exists(path) else None
 
 
 
@@ -309,170 +296,116 @@ def _register_services(hass: HomeAssistant) -> None:
         return
     data["_services_registered"] = True
 
-    async def handle_add(call: ServiceCall) -> None:
-        cal_ent = call.data["calendar"]
-        _LOGGER.debug("ICS_CALENDAR_TOOLS add_event call data=%s", dict(call.data))
+async def handle_add(call: ServiceCall) -> None:
+    cal_ent = call.data["calendar"]
+    _LOGGER.debug("ICS_CALENDAR_TOOLS add_event call data=%s", dict(call.data))
 
-        summary = call.data.get("summary") or ""
-        description = call.data.get("description")
-        location = call.data.get("location")
-        all_day = bool(call.data.get("all_day", False))
-        start_s = call.data.get("start")
-        end_s = call.data.get("end")
-        rrule_s = call.data.get("rrule")
+    summary = call.data.get("summary") or ""
+    description = call.data.get("description")
+    location = call.data.get("location")
+    all_day = bool(call.data.get("all_day", False))
+    start_s = call.data.get("start")
+    end_s = call.data.get("end")
+    rrule_s = call.data.get("rrule")
 
-        if not start_s or not end_s:
-            raise ValueError("add_event requires start and end.")
+    if not start_s or not end_s:
+        raise ValueError("add_event requires start and end.")
 
-        ics_path = _local_ics_path_or_none(cal_ent)
+    rrule_val = ""
+    try:
+        rrule_val = str(rrule_s).strip() if (rrule_s is not None and str(rrule_s).strip()) else ""
+    except Exception:
+        rrule_val = ""
 
-        # --- Local Calendar (.ics) path exists -> write directly ---
-        if ics_path:
-            before_mtime = None
-            try:
-                before_mtime = os.path.getmtime(ics_path)
-            except Exception:
-                pass
+    ics_path = _local_ics_path_or_none(cal_ent)
 
-            cal = await hass.async_add_executor_job(_load_icalendar, ics_path)
+    # --- Local Calendar (.ics) path exists -> write directly ---
+    if ics_path:
+        from icalendar import Event
+        before_mtime = None
+        try:
+            before_mtime = os.path.getmtime(ics_path)
+        except Exception:
+            pass
 
-            ev = Event()
-            ev.add("uid", call.data.get("uid") or str(uuid.uuid4()))
-            ev.add("dtstamp", datetime.utcnow())
+        cal = await hass.async_add_executor_job(_load_icalendar, ics_path)
 
-            ev.add("summary", summary)
-            if description is not None:
-                ev.add("description", description)
-            if location is not None:
-                ev.add("location", location)
-
-            if all_day:
-                ev.add("dtstart", _to_date(start_s))
-                ev.add("dtend", _to_date(end_s))
-            else:
-                ev.add("dtstart", _to_dt(start_s))
-                ev.add("dtend", _to_dt(end_s))
-
-            if rrule_s is not None and str(rrule_s).strip():
-                from icalendar import vRecur
-                ev.add("rrule", vRecur.from_ical(str(rrule_s).strip()))
-
-            cal.add_component(ev)
-            await hass.async_add_executor_job(_write_icalendar_atomic, ics_path, cal)
-            await _force_refresh_after_edit(hass, cal_ent, ics_path, before_mtime)
-            return
-
-        # --- Not a Local Calendar (.ics) -> use HA Calendar services ---
-        # Create a single event first (calendar.create_event does not accept RRULE today).
-        create_data: dict[str, Any] = {
-            "entity_id": cal_ent,
-            "summary": summary,
-        }
+        ev = Event()
+        ev.add("uid", call.data.get("uid") or str(uuid.uuid4()))
+        ev.add("dtstamp", datetime.utcnow())
+        ev.add("summary", summary)
         if description is not None:
-            create_data["description"] = description
+            ev.add("description", description)
         if location is not None:
-            create_data["location"] = location
+            ev.add("location", location)
 
         if all_day:
-            create_data["start_date"] = _to_date(start_s).isoformat()
-            create_data["end_date"] = _to_date(end_s).isoformat()
+            ev.add("dtstart", _to_date(start_s))
+            ev.add("dtend", _to_date(end_s))
         else:
-            create_data["start_date_time"] = _to_dt(start_s).strftime("%Y-%m-%d %H:%M:%S")
-            create_data["end_date_time"] = _to_dt(end_s).strftime("%Y-%m-%d %H:%M:%S")
+            ev.add("dtstart", _to_dt(start_s))
+            ev.add("dtend", _to_dt(end_s))
 
-        # Create the base event.
-rrule_val = ""
-try:
-    rrule_val = str(rrule_s).strip() if (rrule_s is not None and str(rrule_s).strip()) else ""
-except Exception:
-    rrule_val = ""
+        if rrule_val:
+            from icalendar import vRecur
+            ev.add("rrule", vRecur.from_ical(rrule_val))
 
-# Best effort: for calendars where calendar.get_events does NOT expose UID (e.g. some providers),
-# we try to force a known UID at create-time so we can apply RRULE immediately after.
-forced_uid = str(uuid.uuid4()) if rrule_val else None
+        cal.add_component(ev)
+        await hass.async_add_executor_job(_write_icalendar_atomic, ics_path, cal)
+        await _force_refresh_after_edit(hass, cal_ent, ics_path, before_mtime)
+        return
 
-async def _create_base_event() -> None:
-    # Prefer calling the CalendarEntity method directly so we can pass uid even if the service schema
-    # doesn't allow it in this HA version.
-    comp = hass.data.get("calendar")
-    ent = None
-    if comp is not None and hasattr(comp, "get_entity"):
+    # --- Not a Local Calendar (.ics) -> use HA Calendar services ---
+    # calendar.create_event does not accept RRULE in many HA versions/providers, so we:
+    # 1) create base event
+    # 2) poll calendar.get_events until UID appears
+    # 3) calendar.update_event(uid, rrule)
+
+    create_data: dict[str, Any] = {
+        "entity_id": cal_ent,
+        "summary": summary,
+    }
+    if description is not None:
+        create_data["description"] = description
+    if location is not None:
+        create_data["location"] = location
+
+    if all_day:
+        create_data["start_date"] = _to_date(start_s).isoformat()
+        create_data["end_date"] = _to_date(end_s).isoformat()
+    else:
+        create_data["start_date_time"] = _to_dt(start_s).strftime("%Y-%m-%d %H:%M:%S")
+        create_data["end_date_time"] = _to_dt(end_s).strftime("%Y-%m-%d %H:%M:%S")
+
+    await hass.services.async_call("calendar", "create_event", create_data, blocking=True)
+
+    # If no RRULE requested, we're done.
+    if not rrule_val:
         try:
-            ent = comp.get_entity(cal_ent)
+            await hass.services.async_call(
+                "homeassistant",
+                "update_entity",
+                {"entity_id": cal_ent},
+                blocking=True,
+            )
         except Exception:
-            ent = None
+            pass
+        return
 
-    kwargs = dict(create_data)
-    if forced_uid:
-        kwargs["uid"] = forced_uid
+    # Poll get_events for UID (some providers are slow to surface it)
+    if all_day:
+        start_dt = dt_util.as_local(dt_util.parse_datetime(f"{create_data['start_date']} 00:00:00"))
+        end_dt = dt_util.as_local(dt_util.parse_datetime(f"{create_data['end_date']} 23:59:59"))
+    else:
+        start_dt = dt_util.as_local(_to_dt(start_s))
+        end_dt = dt_util.as_local(_to_dt(end_s))
 
-    if ent is not None and hasattr(ent, "async_create_event"):
-        try:
-            await ent.async_create_event(**kwargs)
-            return
-        except TypeError:
-            # Some implementations may not accept uid at create-time.
-            if forced_uid:
-                kwargs = dict(create_data)
-                await ent.async_create_event(**kwargs)
-                return
-            raise
+    range_start = (start_dt - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+    range_end = (end_dt + timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Fallback to the service call
-    try:
-        await hass.services.async_call("calendar", "create_event", kwargs, blocking=True)
-    except Exception:
-        # If uid is rejected by service validation, retry without it.
-        if forced_uid:
-            await hass.services.async_call("calendar", "create_event", dict(create_data), blocking=True)
-            return
-        raise
+    uid: str | None = None
 
-await _create_base_event()
-
-# If no RRULE requested, we are done.
-if not rrule_val:
-    try:
-        await hass.services.async_call(
-            "homeassistant",
-            "update_entity",
-            {"entity_id": cal_ent},
-            blocking=True,
-        )
-    except Exception:
-        pass
-    return
-
-# RRULE requested: apply recurrence.
-uid = forced_uid
-
-# Try applying RRULE with the forced UID first (works when create-time uid is honored).
-try:
-    await hass.services.async_call(
-        "calendar",
-        "update_event",
-        {
-            "entity_id": cal_ent,
-            "uid": uid,
-            "rrule": rrule_val,
-        },
-        blocking=True,
-    )
-except Exception as e:
-    _LOGGER.warning(
-        "ICS_CALENDAR_TOOLS add_event: update_event with forced uid failed (%s). Falling back to UID lookup via calendar.get_events.",
-        e,
-    )
-    uid = None
-
-if not uid:
-    # Fallback: attempt to locate UID via calendar.get_events (note: some providers do NOT expose UID here).
-    try:
-        start_dt = _to_dt(start_s)
-        end_dt = _to_dt(end_s)
-        range_start = (start_dt - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        range_end = (end_dt + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-
+    async def _fetch_uid_once() -> str | None:
         resp = await hass.services.async_call(
             "calendar",
             "get_events",
@@ -487,62 +420,53 @@ if not uid:
 
         events = []
         if isinstance(resp, dict):
-            events = resp.get(cal_ent) or resp.get("events") or []
+            events = resp.get("events") or resp.get(cal_ent) or []
         if isinstance(events, dict):
             events = list(events.values())
 
         want_summary = str(summary or "").strip()
-        want_start = _to_dt(start_s)
         for ev in events or []:
             if not isinstance(ev, dict):
                 continue
-            ev_sum = str(ev.get("summary") or "").strip()
-            ev_start = ev.get("start")
+            if want_summary and str(ev.get("summary") or "").strip() != want_summary:
+                continue
             ev_uid = ev.get("uid") or ev.get("id")
-            try:
-                ev_start_dt = _to_dt(ev_start)
-            except Exception:
-                continue
-            if want_summary and ev_sum != want_summary:
-                continue
-            if abs((ev_start_dt - want_start).total_seconds()) <= 120:
-                uid = ev_uid
-                break
+            if ev_uid:
+                return ev_uid
+        return None
 
-        # As a last resort, pick the first event in the time window.
-        if not uid and events:
-            first = events[0]
-            if isinstance(first, dict):
-                uid = first.get("uid") or first.get("id")
-
+    for _ in range(12):  # ~6s total
+        uid = await _fetch_uid_once()
         if uid:
-            await hass.services.async_call(
-                "calendar",
-                "update_event",
-                {
-                    "entity_id": cal_ent,
-                    "uid": uid,
-                    "rrule": rrule_val,
-                },
-                blocking=True,
-            )
-    except Exception as e:
-        _LOGGER.warning("ICS_CALENDAR_TOOLS add_event: failed to locate newly created event UID for RRULE update: %s", e)
+            break
+        await asyncio.sleep(0.5)
 
-if not uid:
-    raise ValueError(
-        "Created the base event, but could not retrieve its UID to apply RRULE. "
-        "This HA version/integration may not expose UID via calendar.get_events."
+    if not uid:
+        raise ValueError(
+            "Created the base event, but could not retrieve its UID to apply RRULE. "
+            "This HA version/integration may not expose UID via calendar.get_events."
+        )
+
+    await hass.services.async_call(
+        "calendar",
+        "update_event",
+        {
+            "entity_id": cal_ent,
+            "uid": uid,
+            "rrule": rrule_val,
+        },
+        blocking=True,
     )
 
-await hass.services.async_call(
-                "homeassistant",
-                "update_entity",
-                {"entity_id": cal_ent},
-                blocking=True,
-            )
-        except Exception:
-            pass
+    try:
+        await hass.services.async_call(
+            "homeassistant",
+            "update_entity",
+            {"entity_id": cal_ent},
+            blocking=True,
+        )
+    except Exception:
+        pass
 
 
     async def handle_delete(call: ServiceCall) -> None:
@@ -678,16 +602,6 @@ await hass.services.async_call(
                 comp["LOCATION"] = new_loc
             if new_desc is not None:
                 comp["DESCRIPTION"] = new_desc
-
-            new_rrule = call.data.get("rrule")
-            if new_rrule is not None:
-                # Set or clear RRULE (RFC5545). Empty string clears the rule.
-                if str(new_rrule).strip() == "":
-                    if comp.get("RRULE") is not None:
-                        del comp["RRULE"]
-                else:
-                    from icalendar import vRecur
-                    comp["RRULE"] = vRecur.from_ical(str(new_rrule).strip())
 
             updated += 1
 
