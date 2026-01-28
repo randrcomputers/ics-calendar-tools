@@ -1,51 +1,3 @@
-add_event:
-  name: Add event to Local Calendar .ics
-  fields:
-    calendar:
-      name: Calendar entity_id
-      example: "calendar.family"
-      required: true
-      selector:
-        entity:
-          domain: calendar
-    summary:
-      name: Summary
-      example: "Trash Day"
-      required: true
-      selector:
-        text: {}
-    description:
-      name: Description
-      required: false
-      selector:
-        text: {}
-    location:
-      name: Location
-      required: false
-      selector:
-        text: {}
-    all_day:
-      name: All day event
-      required: false
-      default: false
-      selector:
-        boolean: {}
-    start:
-      name: Start (date YYYY-MM-DD for all-day, or datetime ISO/`YYYY-MM-DD HH:MM:SS`)
-      required: true
-      selector:
-        text: {}
-    end:
-      name: End (date YYYY-MM-DD for all-day, or datetime ISO/`YYYY-MM-DD HH:MM:SS`)
-      required: true
-      selector:
-        text: {}
-    rrule:
-      name: RRULE body (e.g. `FREQ=DAILY;INTERVAL=1;UNTIL=20260131` or `...Z`)
-      required: false
-      selector:
-        text: {}
-
 delete_event:
   name: Delete event from Local Calendar .ics
   fields:
@@ -118,6 +70,11 @@ update_event:
         text: {}
     description:
       name: New Description
+      required: false
+      selector:
+        text: {}
+    rrule:
+      name: RRULE body (e.g. `FREQ=DAILY;INTERVAL=1;UNTIL=...`)
       required: false
       selector:
         text: {}
