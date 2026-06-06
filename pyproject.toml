@@ -1,0 +1,17 @@
+[tool.mypy]
+python_version = "3.14"
+ignore_missing_imports = true
+warn_unused_ignores = true
+pretty = true
+show_error_codes = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

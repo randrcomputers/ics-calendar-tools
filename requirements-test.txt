@@ -1,0 +1,4 @@
+homeassistant==2026.5.2
+pytest-homeassistant-custom-component>=0.13.323
+pytest-cov>=7.0.0
+icalendar>=6.0.0,<7.0

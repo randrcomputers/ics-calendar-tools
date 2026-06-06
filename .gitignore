@@ -1,2 +1,30 @@
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Editor and OS files
+.DS_Store
+
+# Local runtime files
+config/
+outputdata/
+.python-version

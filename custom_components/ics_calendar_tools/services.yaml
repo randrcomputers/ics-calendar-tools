@@ -1,35 +1,66 @@
-delete_event:
-  name: Delete event from Local Calendar .ics
+list_events:
+  name: List events from Local Calendar .ics
+  description: Return events for a Local Calendar, including UID values.
   fields:
     calendar:
-      name: Calendar entity_id
-      example: "calendar.family"
       required: true
       selector:
         entity:
           domain: calendar
-    uid:
-      name: UID (preferred)
-      example: "1234567890@homeassistant"
-      required: false
-      selector:
-        text: {}
-    summary:
-      name: Summary (fallback match)
-      example: "Trash Day"
-      required: false
-      selector:
-        text: {}
     start:
-      name: Start (fallback match)
       required: false
       selector:
         datetime:
     end:
-      name: End (fallback match)
       required: false
       selector:
         datetime:
+    limit:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 1000
+          mode: box
+
+add_event:
+  name: Add event to Local Calendar .ics
+  description: Add an event (optionally repeating via RRULE) to a Local Calendar .ics file.
+  fields:
+    calendar:
+      required: true
+      selector:
+        entity:
+          domain: calendar
+    summary:
+      required: true
+      selector:
+        text:
+    description:
+      required: false
+      selector:
+        text:
+          multiline: true
+    location:
+      required: false
+      selector:
+        text:
+    all_day:
+      required: true
+      selector:
+        boolean:
+    start:
+      required: true
+      selector:
+        datetime:
+    end:
+      required: true
+      selector:
+        datetime:
+    rrule:
+      required: false
+      selector:
+        text:
 
 update_event:
   name: Update event in Local Calendar .ics
@@ -71,67 +102,63 @@ update_event:
       required: false
       selector:
         text: {}
+    rrule:
+      name: New RRULE
+      required: false
+      selector:
+        text: {}
 
-add_event:
-  name: Add event to Local Calendar .ics
-  description: Add an event (optionally repeating via RRULE) to a Local Calendar .ics file.
+delete_event:
+  name: Delete event from Local Calendar .ics
+  fields:
+    calendar:
+      name: Calendar entity_id
+      example: "calendar.family"
+      required: true
+      selector:
+        entity:
+          domain: calendar
+    uid:
+      name: UID (preferred)
+      example: "1234567890@homeassistant"
+      required: false
+      selector:
+        text: {}
+    summary:
+      name: Summary (fallback match)
+      example: "Trash Day"
+      required: false
+      selector:
+        text: {}
+    start:
+      name: Start (fallback match)
+      required: false
+      selector:
+        datetime:
+    end:
+      name: End (fallback match)
+      required: false
+      selector:
+        datetime:
+
+import_events:
+  name: Import events into Local Calendar .ics
+  description: Validate pasted ICS content, optionally clear the selected Local Calendar, and import the events.
   fields:
     calendar:
       required: true
       selector:
         entity:
           domain: calendar
-    summary:
+    ics:
+      name: ICS file content
       required: true
-      selector:
-        text:
-    description:
-      required: false
       selector:
         text:
           multiline: true
-    location:
+    clear_existing_events:
+      name: Clear existing events
       required: false
+      default: false
       selector:
-        text:
-    all_day:
-      required: true
-      selector:
-        boolean:
-    start:
-      required: true
-      selector:
-        datetime:
-    end:
-      required: true
-      selector:
-        datetime:
-    rrule:
-      required: false
-      selector:
-        text:
-
-list_events:
-  name: List events from Local Calendar .ics
-  description: Return events for a Local Calendar, including UID values.
-  fields:
-    calendar:
-      required: true
-      selector:
-        entity:
-          domain: calendar
-    start:
-      required: false
-      selector:
-        datetime:
-    end:
-      required: false
-      selector:
-        datetime:
-    limit:
-      required: false
-      selector:
-        number:
-          min: 1
-          max: 1000
-          mode: box
+        boolean: {}

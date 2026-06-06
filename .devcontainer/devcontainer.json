@@ -1,0 +1,29 @@
+{
+  "name": "ics-calendar-tools",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "python -m pip install --upgrade pip && uv pip install --system -r requirements-dev.txt && pre-commit install --install-hooks",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.mypy-type-checker",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": [
+          "tests"
+        ],
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        }
+      }
+    }
+  },
+  "remoteUser": "root"
+}

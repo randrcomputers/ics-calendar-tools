@@ -4,11 +4,155 @@
     "step": {
       "user": {
         "title": "ICS Calendar Tools",
-        "description": "Registers services to add, list, delete, and update events in Local Calendar (.ics) calendars."
+        "description": "Registers services to list, add, update, delete, and import events in Local Calendar (.ics) calendars."
       }
     },
     "abort": {
       "single_instance_allowed": "Only one instance is needed."
+    }
+  },
+  "services": {
+    "list_events": {
+      "name": "List events from Local Calendar .ics",
+      "description": "Return events for a Local Calendar, including UID values.",
+      "fields": {
+        "calendar": {
+          "name": "Calendar",
+          "description": "Local Calendar entity id."
+        },
+        "start": {
+          "name": "Start",
+          "description": "Only include events that overlap this datetime/date."
+        },
+        "end": {
+          "name": "End",
+          "description": "Only include events that start before this datetime/date."
+        },
+        "limit": {
+          "name": "Limit",
+          "description": "Maximum number of events to return."
+        }
+      }
+    },
+    "add_event": {
+      "name": "Add event to Local Calendar .ics",
+      "description": "Add an event to a Local Calendar .ics file.",
+      "fields": {
+        "calendar": {
+          "name": "Calendar",
+          "description": "Local Calendar entity id."
+        },
+        "summary": {
+          "name": "Summary",
+          "description": "Event title."
+        },
+        "description": {
+          "name": "Description",
+          "description": "Event description."
+        },
+        "location": {
+          "name": "Location",
+          "description": "Event location."
+        },
+        "all_day": {
+          "name": "All day",
+          "description": "Create an all-day event when enabled."
+        },
+        "start": {
+          "name": "Start",
+          "description": "Event start date/datetime."
+        },
+        "end": {
+          "name": "End",
+          "description": "Event end date/datetime."
+        },
+        "rrule": {
+          "name": "RRULE",
+          "description": "Optional recurrence rule."
+        }
+      }
+    },
+    "update_event": {
+      "name": "Update event in Local Calendar .ics",
+      "description": "Update a Local Calendar event identified by UID.",
+      "fields": {
+        "calendar": {
+          "name": "Calendar",
+          "description": "Local Calendar entity id."
+        },
+        "uid": {
+          "name": "UID",
+          "description": "UID of the event to update."
+        },
+        "summary": {
+          "name": "Summary",
+          "description": "New event title."
+        },
+        "start": {
+          "name": "Start",
+          "description": "New event start datetime."
+        },
+        "end": {
+          "name": "End",
+          "description": "New event end datetime."
+        },
+        "location": {
+          "name": "Location",
+          "description": "New event location."
+        },
+        "description": {
+          "name": "Description",
+          "description": "New event description."
+        },
+        "rrule": {
+          "name": "RRULE",
+          "description": "New recurrence rule (empty removes RRULE)."
+        }
+      }
+    },
+    "delete_event": {
+      "name": "Delete event from Local Calendar .ics",
+      "description": "Delete a Local Calendar event by UID or fallback matchers.",
+      "fields": {
+        "calendar": {
+          "name": "Calendar",
+          "description": "Local Calendar entity id."
+        },
+        "uid": {
+          "name": "UID",
+          "description": "UID of the event to delete (preferred)."
+        },
+        "summary": {
+          "name": "Summary",
+          "description": "Fallback summary matcher."
+        },
+        "start": {
+          "name": "Start",
+          "description": "Fallback start matcher."
+        },
+        "end": {
+          "name": "End",
+          "description": "Fallback end matcher."
+        }
+      }
+    },
+    "import_events": {
+      "name": "Import events into Local Calendar .ics",
+      "description": "Validate pasted ICS content, optionally clear the selected Local Calendar, and import the events.",
+      "fields": {
+        "calendar": {
+          "name": "Calendar",
+          "description": "Local Calendar entity id."
+        },
+        "ics": {
+          "name": "ICS file content",
+          "description": "Full ICS file content to import."
+        },
+        "clear_existing_events": {
+          "name": "Clear existing events",
+          "description": "Remove existing events before importing."
+        }
+      }
     }
   }
 }

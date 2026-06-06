@@ -1,0 +1,3 @@
+[MESSAGES CONTROL]
+# Mirrors the common Home Assistant workaround for newer typing internals.
+disable=unsubscriptable-object

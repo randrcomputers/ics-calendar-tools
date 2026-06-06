@@ -5,82 +5,87 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import date, datetime, timedelta
-from typing import Any, Mapping
+from contextlib import suppress
+from datetime import date, datetime
+from typing import Any
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    ICS_EXTENSION,
+    LOCAL_CALENDAR_PREFIX,
+    LOCAL_CALENDAR_STORAGE_PATH,
+    SERVICE_ADD_EVENT,
+    SERVICE_DELETE_EVENT,
+    SERVICE_IMPORT_EVENTS,
+    SERVICE_LIST_EVENTS,
+    SERVICE_UPDATE_EVENT,
+)
+from .helpers import (
+    _coerce_all_day_end,
+    _coerce_date,
+    _coerce_dt,
+    _coerce_local_floating_dt,
+    _component_tzid,
+    _dt_from_ical,
+    _event_end_dt,
+    _ical_property_value,
+    _is_all_day_component,
+    _iso_ical_value,
+    _match_event,
+    _uid_from_call_data,
+)
+from .service_schemas import (
+    ADD_EVENT_SCHEMA,
+    DELETE_EVENT_SCHEMA,
+    IMPORT_EVENTS_SCHEMA,
+    LIST_EVENTS_SCHEMA,
+    UPDATE_EVENT_SCHEMA,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-LOCAL_CALENDAR_STORAGE_PATH = "/config/.storage"
-LOCAL_CALENDAR_PREFIX = "local_calendar."
-ICS_EXTENSION = ".ics"
+
+def _local_calendar_ics_path(hass: HomeAssistant, slug: str) -> str:
+    return hass.config.path(
+        LOCAL_CALENDAR_STORAGE_PATH,
+        f"{LOCAL_CALENDAR_PREFIX}{slug}{ICS_EXTENSION}",
+    )
 
 
-def _local_calendar_ics_path(slug: str) -> str:
-    return f"{LOCAL_CALENDAR_STORAGE_PATH}/{LOCAL_CALENDAR_PREFIX}{slug}{ICS_EXTENSION}"
-
-
-def _to_dt(value: str) -> datetime:
-    dt = dt_util.parse_datetime(value)
-    if dt is None:
-        raise ValueError(f"Invalid datetime: {value}")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
-    return dt
-
-
-def _coerce_dt(value: Any) -> datetime:
-    """Accept a datetime object (from a datetime selector) or a string and return an aware local datetime."""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
-        return dt_util.as_local(value)
-    return _to_dt(str(value).strip().replace(" ", "T"))
-
-
-def _coerce_date(value: Any) -> date:
-    """Accept a date/datetime object or string and return a date (for all-day events)."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    s = str(value).strip()
-    d = dt_util.parse_date(s)
-    if d:
-        return d
-    return _to_dt(s.replace(" ", "T")).date()
-
-
-def _find_ics_path_for_calendar(hass: HomeAssistant, calendar_entity_id: str) -> str:
+async def _find_ics_path_for_calendar(hass: HomeAssistant, calendar_entity_id: str) -> str:
     """Resolve Local Calendar .ics path using the entity's storage_key."""
     ent_reg = er.async_get(hass)
     entity = ent_reg.async_get(calendar_entity_id)
 
     if not entity:
-        raise ValueError(f"Entity not found in registry: {calendar_entity_id}")
+        raise ServiceValidationError(f"Entity not found in registry: {calendar_entity_id}")
 
     if entity.platform != "local_calendar":
-        raise ValueError(f"{calendar_entity_id} is not a Local Calendar entity")
+        raise ServiceValidationError(f"{calendar_entity_id} is not a Local Calendar entity")
 
     if not entity.config_entry_id:
-        raise ValueError(f"{calendar_entity_id} has no config_entry_id")
+        raise ServiceValidationError(f"{calendar_entity_id} has no config_entry_id")
 
     cfg = hass.config_entries.async_get_entry(entity.config_entry_id)
     if not cfg or cfg.domain != "local_calendar":
-        raise ValueError(f"{calendar_entity_id} is not backed by local_calendar config entry")
+        raise ServiceValidationError(
+            f"{calendar_entity_id} is not backed by local_calendar config entry"
+        )
 
     storage_key = cfg.data.get("storage_key")
     if not storage_key:
-        raise ValueError(f"Local Calendar config entry has no storage_key: {cfg.entry_id}")
+        raise ServiceValidationError(
+            f"Local Calendar config entry has no storage_key: {cfg.entry_id}"
+        )
 
-    path = _local_calendar_ics_path(str(storage_key))
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Local Calendar .ics file not found: {path}")
+    path = _local_calendar_ics_path(hass, str(storage_key))
+    if not await hass.async_add_executor_job(os.path.exists, path):
+        raise ServiceValidationError(f"Local Calendar .ics file not found: {path}")
 
     return path
 
@@ -93,15 +98,99 @@ def _load_icalendar(path: str):
     return Calendar.from_ical(data)
 
 
+def _load_import_icalendar(raw_ics: str):
+    from icalendar import Calendar
+
+    ics_text = raw_ics.strip()
+    if not ics_text:
+        raise ServiceValidationError("ics is required")
+
+    try:
+        cal = Calendar.from_ical(ics_text)
+    except Exception as err:
+        raise ServiceValidationError("Invalid ICS content.") from err
+
+    if getattr(cal, "name", None) != "VCALENDAR":
+        raise ServiceValidationError("ICS content must contain a VCALENDAR.")
+
+    imported_event_uids: set[str] = set()
+    imported_events = []
+    imported_timezones = []
+
+    for component in cal.subcomponents:
+        if component.name == "VTIMEZONE":
+            tzid = str(component.get("TZID", "")).strip()
+            if not tzid:
+                raise ServiceValidationError("Imported VTIMEZONE is missing TZID.")
+            imported_timezones.append(component)
+            continue
+
+        if component.name != "VEVENT":
+            continue
+
+        uid = str(component.get("UID", "")).strip()
+        if not uid:
+            raise ServiceValidationError("Each imported event must have a UID.")
+        if uid in imported_event_uids:
+            raise ServiceValidationError(f"Duplicate UID in imported ICS content: {uid}")
+
+        dtstart_prop = component.get("DTSTART")
+        if dtstart_prop is None:
+            raise ServiceValidationError(f"Imported event {uid} is missing DTSTART.")
+
+        start_dt = _dt_from_ical(dtstart_prop)
+        if start_dt is None:
+            raise ServiceValidationError(f"Imported event {uid} has an invalid DTSTART.")
+
+        dtend_prop = component.get("DTEND")
+        if dtend_prop is not None:
+            start_raw = _ical_property_value(dtstart_prop)
+            end_raw = _ical_property_value(dtend_prop)
+            if isinstance(start_raw, datetime) != isinstance(end_raw, datetime):
+                raise ServiceValidationError(
+                    f"Imported event {uid} must use matching DTSTART/DTEND value types."
+                )
+
+        end_dt = _event_end_dt(component)
+        if end_dt is not None and end_dt <= start_dt:
+            raise ServiceValidationError(f"Imported event {uid} must end after it starts.")
+
+        # All-day 00:00:00 logic: if DTSTART and DTEND are both at 00:00:00
+        # and duration is 24h, treat as all-day
+        end_dt_val = _dt_from_ical(dtend_prop) if dtend_prop is not None else None
+        if isinstance(start_dt, datetime) and isinstance(end_dt_val, datetime):
+            start_time = start_dt.time()
+            end_time = end_dt_val.time()
+            duration = end_dt_val - start_dt
+            if (
+                start_time == end_time == datetime.min.time()
+                and duration.days == 1
+                and duration.seconds == 0
+            ):
+                # Convert to all-day (date only) and set VALUE=DATE param
+                from icalendar import vDate
+
+                all_day_start = date(start_dt.year, start_dt.month, start_dt.day)
+                all_day_end = date(end_dt_val.year, end_dt_val.month, end_dt_val.day)
+                component["DTSTART"] = vDate(all_day_start)
+                component["DTEND"] = vDate(all_day_end)
+                component["DTSTART"].params["VALUE"] = "DATE"
+                component["DTEND"].params["VALUE"] = "DATE"
+        imported_event_uids.add(uid)
+        imported_events.append(component)
+
+    if not imported_events:
+        raise ServiceValidationError("ICS content must contain at least one VEVENT.")
+
+    return imported_timezones, imported_events, imported_event_uids
+
+
 def _write_icalendar_atomic(path: str, cal) -> None:
     """Write ICS safely: backup, atomic replace, best-effort fsync."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = f"{path}.bak_{ts}"
-    try:
+    with suppress(Exception):
         shutil.copy2(path, backup)
-    except Exception:
-        # If file didn't exist yet, ignore
-        pass
 
     directory = os.path.dirname(path)
     fd, tmp_path = tempfile.mkstemp(prefix="ics_", suffix=".tmp", dir=directory)
@@ -138,159 +227,36 @@ def _write_icalendar_atomic(path: str, cal) -> None:
             pass
 
 
-def _normalize_summary(s: str | None) -> str | None:
-    if s is None:
-        return None
-    s2 = " ".join(str(s).strip().split())
-    return s2.lower()
-
-
-def _uid_from_call_data(data: Mapping[str, Any]) -> str | None:
-    """Accept UID from several common keys used by cards/integrations."""
-    for k in (
-        "uid",
-        "UID",
-        "id",
-        "event_id",
-        "eventId",
-        "event_uid",
-        "eventUid",
-        "ical_uid",
-        "icalUid",
-    ):
-        v = data.get(k)
-        if v:
-            return str(v).strip()
-    return None
-
-
-def _dt_from_ical(value) -> datetime | None:
-    """Convert DTSTART/DTEND's .dt (date or datetime) to datetime (local)."""
-    if value is None:
-        return None
-    v = getattr(value, "dt", value)
-    if isinstance(v, datetime):
-        return dt_util.as_local(v)
-    # date -> treat as local start of day
+def _get_mtime(path: str) -> float | None:
     try:
-        return dt_util.as_local(dt_util.start_of_local_day(v))
+        return os.path.getmtime(path)
     except Exception:
         return None
 
 
-def _event_end_dt(component) -> datetime | None:
-    """Return event end datetime, handling DTEND or DURATION."""
-    ev_end = component.get("DTEND")
-    if ev_end:
-        return _dt_from_ical(ev_end)
-    dur = component.get("DURATION")
-    if dur:
-        try:
-            start = _dt_from_ical(component.get("DTSTART"))
-            if start is None:
-                return None
-            # icalendar stores DURATION as datetime.timedelta typically
-            if isinstance(dur.dt, timedelta):
-                return start + dur.dt
-        except Exception:
-            return None
-    return None
+async def _async_get_mtime(hass: HomeAssistant, path: str) -> float | None:
+    return await hass.async_add_executor_job(_get_mtime, path)
 
 
-def _iso_ical_value(value) -> str | None:
-    """Convert iCalendar date/datetime values to ISO strings."""
-    if value is None:
-        return None
-    v = getattr(value, "dt", value)
-    if isinstance(v, datetime):
-        return dt_util.as_local(v).isoformat()
-    if isinstance(v, date):
-        return v.isoformat()
-    return str(v)
+def _ics_file_lock(hass: HomeAssistant, path: str) -> asyncio.Lock:
+    data = hass.data.setdefault(DOMAIN, {})
+    locks = data.setdefault("_ics_file_locks", {})
+    return locks.setdefault(path, asyncio.Lock())
 
 
-def _match_event(component, uid: str | None, summary: str | None, start: datetime | None, end: datetime | None) -> bool:
-    if component.name != "VEVENT":
-        return False
-
-    # UID match (preferred)
-    if uid:
-        ev_uid = str(component.get("UID", "")).strip()
-
-        # Most of the time UID is exact match.
-        if ev_uid == uid:
-            return True
-
-        # Some UIs pass composite IDs; be tolerant only when it looks safe.
-        if len(uid) >= 12 and (uid in ev_uid or ev_uid in uid):
-            return True
-
-        return False
-
-    # Fallback matching by summary/start/end (best-effort)
-    if summary is not None:
-        if _normalize_summary(str(component.get("SUMMARY", ""))) != _normalize_summary(summary):
-            return False
-
-    if start is not None:
-        ev_start_dt = _dt_from_ical(component.get("DTSTART"))
-        if ev_start_dt is None:
-            return False
-        if abs(dt_util.as_local(ev_start_dt) - dt_util.as_local(start)) > timedelta(minutes=1):
-            return False
-
-    if end is not None:
-        ev_end_dt = _event_end_dt(component)
-        if ev_end_dt is None:
-            return False
-        if abs(dt_util.as_local(ev_end_dt) - dt_util.as_local(end)) > timedelta(minutes=1):
-            return False
-
-    return True
-
-
-def _all_local_calendar_ics_paths() -> list[str]:
-    base = LOCAL_CALENDAR_STORAGE_PATH
-    out: list[str] = []
-    try:
-        for name in os.listdir(base):
-            if name.startswith(LOCAL_CALENDAR_PREFIX) and name.endswith(ICS_EXTENSION):
-                out.append(os.path.join(base, name))
-    except Exception:
-        pass
-    return out
-
-
-def _ics_paths_containing_uid(uid: str) -> list[str]:
-    """Fast-ish scan to find which local_calendar.*.ics contains a UID."""
-    uid_s = str(uid).strip()
-    needle1 = f"UID:{uid_s}".encode("utf-8")
-    needle2 = b"UID;"
-    uid_b = uid_s.encode("utf-8")
-
-    matches: list[str] = []
-    for path in _all_local_calendar_ics_paths():
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            if needle1 in data or (needle2 in data and uid_b in data):
-                matches.append(path)
-        except Exception:
-            continue
-    return matches
-
-
-async def _wait_for_mtime_change(path: str, before: float | None, timeout_s: float = 2.0) -> None:
+async def _wait_for_mtime_change(
+    hass: HomeAssistant,
+    path: str,
+    before: float | None,
+    timeout_s: float = 2.0,
+) -> None:
     if before is None:
         return
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     while loop.time() < deadline:
-        try:
-            now = os.path.getmtime(path)
-            if now != before:
-                return
-        except Exception:
+        now = await _async_get_mtime(hass, path)
+        if now is None or now != before:
             return
         await asyncio.sleep(0.1)
 
@@ -307,26 +273,30 @@ async def _reload_local_calendar_entries(hass: HomeAssistant) -> None:
         try:
             await hass.config_entries.async_reload(entry.entry_id)
         except Exception as e:
-            _LOGGER.warning("ICS_CALENDAR_TOOLS: failed to reload local_calendar entry %s: %s", entry.entry_id, e)
+            _LOGGER.warning(
+                "ICS_CALENDAR_TOOLS: failed to reload local_calendar entry %s: %s",
+                entry.entry_id,
+                e,
+            )
 
 
-async def _force_refresh_after_edit(hass: HomeAssistant, cal_ent: str, ics_path: str, before_mtime: float | None) -> None:
+async def _force_refresh_after_edit(
+    hass: HomeAssistant, cal_ent: str, ics_path: str, before_mtime: float | None
+) -> None:
     # Ensure filesystem mtime has updated so Local Calendar reload reads fresh content
-    await _wait_for_mtime_change(ics_path, before_mtime, timeout_s=2.0)
+    await _wait_for_mtime_change(hass, ics_path, before_mtime, timeout_s=2.0)
 
     # Reload Local Calendar entries (preferred; avoids relying on a user script)
     await _reload_local_calendar_entries(hass)
 
     # Nudge the specific calendar entity the UI is showing (best-effort)
-    try:
+    with suppress(Exception):
         await hass.services.async_call(
             "homeassistant",
             "update_entity",
             {"entity_id": cal_ent},
             blocking=True,
         )
-    except Exception:
-        pass
 
 
 def _register_services(hass: HomeAssistant) -> None:
@@ -336,17 +306,14 @@ def _register_services(hass: HomeAssistant) -> None:
         return
     data["_services_registered"] = True
 
-
     async def handle_add(call: ServiceCall) -> None:
         from icalendar import Event, vRecur
 
-        cal_ent = call.data.get("calendar")
-        if not cal_ent:
-            raise ValueError("calendar is required")
+        cal_ent = call.data["calendar"]
 
         summary = (call.data.get("summary") or "").strip()
         if not summary:
-            raise ValueError("summary is required")
+            raise ServiceValidationError("summary is required")
 
         desc = call.data.get("description")
         loc = call.data.get("location")
@@ -355,60 +322,50 @@ def _register_services(hass: HomeAssistant) -> None:
         end_val = call.data.get("end")
         rrule_raw = (call.data.get("rrule") or "").strip()
 
-        if start_val is None or end_val is None:
-            raise ValueError("start and end are required")
+        path = await _find_ics_path_for_calendar(hass, cal_ent)
 
-        path = _find_ics_path_for_calendar(hass, cal_ent)
+        async with _ics_file_lock(hass, path):
+            before_mtime = await _async_get_mtime(hass, path)
 
-        # load calendar
-        try:
-            before_mtime = os.path.getmtime(path)
-        except Exception:
-            before_mtime = None
+            cal = await hass.async_add_executor_job(_load_icalendar, path)
 
-        cal = await hass.async_add_executor_job(_load_icalendar, path)
+            ev = Event()
+            uid = (
+                f"{dt_util.utcnow().strftime('%Y%m%dT%H%M%SZ')}-{os.urandom(4).hex()}@homeassistant"
+            )
+            ev.add("uid", uid)
+            ev.add("summary", summary)
 
-        ev = Event()
-        # Unique UID (stable enough for local .ics)
-        uid = f"{dt_util.utcnow().strftime('%Y%m%dT%H%M%SZ')}-{os.urandom(4).hex()}@homeassistant"
-        ev.add("uid", uid)
-        ev.add("summary", summary)
+            if desc:
+                ev.add("description", str(desc))
+            if loc:
+                ev.add("location", str(loc))
 
-        if desc:
-            ev.add("description", str(desc))
-        if loc:
-            ev.add("location", str(loc))
-
-        if all_day:
-            sdt = _coerce_date(start_val)
-            edt = _coerce_date(end_val)
-            ev.add("dtstart", sdt)
-            # If UI gives an inclusive end date (often equal to start), convert to exclusive end (+1 day)
-            try:
+            if all_day:
+                sdt = _coerce_date(start_val)
+                edt = _coerce_all_day_end(end_val, sdt)
+                ev.add("dtstart", sdt)
+                ev.add("dtend", edt)
+            else:
+                sdt = _coerce_local_floating_dt(start_val)
+                edt = _coerce_local_floating_dt(end_val)
                 if edt <= sdt:
-                    edt = sdt + timedelta(days=1)
-            except Exception:
-                pass
-            ev.add("dtend", edt)
-        else:
-            sdt = _coerce_dt(start_val)
-            edt = _coerce_dt(end_val)
-            ev.add("dtstart", sdt)
-            ev.add("dtend", edt)
+                    raise ServiceValidationError("end must be after start for non all-day events.")
+                ev.add("dtstart", sdt)
+                ev.add("dtend", edt)
 
-        if rrule_raw:
-            # Accept either "RRULE:FREQ=..." or just "FREQ=..."
-            if rrule_raw.upper().startswith("RRULE:"):
-                rrule_raw = rrule_raw.split(":", 1)[1].strip()
-            try:
-                ev.add("rrule", vRecur.from_ical(rrule_raw))
-            except Exception as e:
-                raise ValueError(f"Invalid RRULE: {rrule_raw}") from e
+            if rrule_raw:
+                if rrule_raw.upper().startswith("RRULE:"):
+                    rrule_raw = rrule_raw.split(":", 1)[1].strip()
+                try:
+                    ev.add("rrule", vRecur.from_ical(rrule_raw))
+                except Exception as e:
+                    raise ServiceValidationError(f"Invalid RRULE: {rrule_raw}") from e
 
-        cal.add_component(ev)
+            cal.add_component(ev)
 
-        await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
-        await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
+            await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
+            await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
 
     async def handle_delete(call: ServiceCall) -> None:
         cal_ent = call.data["calendar"]
@@ -418,78 +375,47 @@ def _register_services(hass: HomeAssistant) -> None:
         summary = call.data.get("summary")
         start_val = call.data.get("start")
         end_val = call.data.get("end")
+        if uid is None and summary is None and start_val is None and end_val is None:
+            raise ServiceValidationError(
+                "Delete requires uid, or at least one fallback matcher: summary/start/end."
+            )
 
         start = _coerce_dt(start_val) if start_val is not None else None
         end = _coerce_dt(end_val) if end_val is not None else None
 
-        path = _find_ics_path_for_calendar(hass, cal_ent)
-        before_mtime = None
-        try:
-            before_mtime = os.path.getmtime(path)
-        except Exception:
-            pass
+        path = await _find_ics_path_for_calendar(hass, cal_ent)
 
-        cal = await hass.async_add_executor_job(_load_icalendar, path)
+        async with _ics_file_lock(hass, path):
+            before_mtime = await _async_get_mtime(hass, path)
 
-        removed = 0
-        kept = []
-        for comp in cal.subcomponents:
-            if _match_event(comp, uid, summary, start, end):
-                removed += 1
-            else:
-                kept.append(comp)
+            cal = await hass.async_add_executor_job(_load_icalendar, path)
 
-        if removed == 0:
-            if uid:
-                paths = _ics_paths_containing_uid(str(uid).strip())
-                if not paths:
-                    raise ValueError("No matching event found to delete (UID not found in any local calendar).")
+            removed = 0
+            kept = []
+            for comp in cal.subcomponents:
+                if _match_event(comp, uid, summary, start, end):
+                    removed += 1
+                else:
+                    kept.append(comp)
 
-                deleted_any = False
-                for p in paths:
-                    cal2 = await hass.async_add_executor_job(_load_icalendar, p)
+            if removed == 0:
+                raise ServiceValidationError("No matching event found to delete.")
 
-                    removed2 = 0
-                    kept2 = []
-                    for comp2 in cal2.subcomponents:
-                        if _match_event(comp2, str(uid).strip(), None, None, None):
-                            removed2 += 1
-                        else:
-                            kept2.append(comp2)
+            if removed > 1 and not uid:
+                raise ServiceValidationError(
+                    "Multiple matches found; provide uid to delete precisely."
+                )
 
-                    if removed2:
-                        from icalendar import Calendar
+            from icalendar import Calendar
 
-                        new_cal2 = Calendar()
-                        for k, v in cal2.items():
-                            new_cal2.add(k, v)
-                        for comp2 in kept2:
-                            new_cal2.add_component(comp2)
+            new_cal = Calendar()
+            for k, v in cal.items():
+                new_cal.add(k, v)
+            for comp in kept:
+                new_cal.add_component(comp)
 
-                        await hass.async_add_executor_job(_write_icalendar_atomic, p, new_cal2)
-                        deleted_any = True
-
-                if not deleted_any:
-                    raise ValueError("No matching event found to delete (UID search hit files but VEVENT not removed).")
-
-                await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
-                return
-
-            raise ValueError("No matching event found to delete.")
-
-        if removed > 1 and not uid:
-            raise ValueError("Multiple matches found; provide uid to delete precisely.")
-
-        from icalendar import Calendar
-
-        new_cal = Calendar()
-        for k, v in cal.items():
-            new_cal.add(k, v)
-        for comp in kept:
-            new_cal.add_component(comp)
-
-        await hass.async_add_executor_job(_write_icalendar_atomic, path, new_cal)
-        await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
+            await hass.async_add_executor_job(_write_icalendar_atomic, path, new_cal)
+            await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
 
     async def handle_update(call: ServiceCall) -> None:
         cal_ent = call.data["calendar"]
@@ -503,77 +429,102 @@ def _register_services(hass: HomeAssistant) -> None:
         new_desc = call.data.get("description")
         rrule_raw = (call.data.get("rrule") or "").strip()
 
-        new_start = _coerce_dt(new_start_val) if new_start_val is not None else None
-        new_end = _coerce_dt(new_end_val) if new_end_val is not None else None
-
         if not uid:
-            raise ValueError("Update requires uid/id/event_id (a stable identifier).")
+            raise ServiceValidationError("Update requires uid/id/event_id (a stable identifier).")
+        if not any(
+            key in call.data
+            for key in ("summary", "start", "end", "location", "description", "rrule")
+        ):
+            raise ServiceValidationError("Update requires at least one field to change.")
 
-        path = _find_ics_path_for_calendar(hass, cal_ent)
-        before_mtime = None
-        try:
-            before_mtime = os.path.getmtime(path)
-        except Exception:
-            pass
+        path = await _find_ics_path_for_calendar(hass, cal_ent)
 
-        cal = await hass.async_add_executor_job(_load_icalendar, path)
+        async with _ics_file_lock(hass, path):
+            before_mtime = await _async_get_mtime(hass, path)
 
-        updated = 0
-        for comp in cal.subcomponents:
-            if comp.name != "VEVENT":
-                continue
-            ev_uid = str(comp.get("UID", "")).strip()
-            if ev_uid != str(uid).strip():
-                continue
+            cal = await hass.async_add_executor_job(_load_icalendar, path)
 
-            if new_summary is not None:
-                comp["SUMMARY"] = new_summary
-            if new_start is not None and comp.get("DTSTART") is not None:
-                comp["DTSTART"].dt = new_start
-            if new_end is not None and comp.get("DTEND") is not None:
-                comp["DTEND"].dt = new_end
-            # If event uses DURATION and caller gives end, convert to DTEND
-            if new_end is not None and comp.get("DTEND") is None and comp.get("DTSTART") is not None:
-                try:
-                    comp["DTEND"] = new_end
-                    if comp.get("DURATION") is not None:
-                        del comp["DURATION"]
-                except Exception:
-                    pass
-            if new_loc is not None:
-                comp["LOCATION"] = new_loc
-            if new_desc is not None:
-                comp["DESCRIPTION"] = new_desc
-            # RRULE update (optional). If blank string is passed, clear RRULE.
-            if rrule_raw:
-                from icalendar import vRecur
-                rr = rrule_raw
-                if rr.upper().startswith("RRULE:"):
-                    rr = rr.split(":", 1)[1].strip()
-                try:
-                    comp["RRULE"] = vRecur.from_ical(rr)
-                except Exception as e:
-                    raise ValueError(f"Invalid RRULE: {rr}") from e
-            elif "rrule" in call.data:
-                # Explicitly provided but empty -> remove RRULE
-                try:
-                    if comp.get("RRULE") is not None:
-                        del comp["RRULE"]
-                except Exception:
-                    pass
+            updated = 0
+            for comp in cal.subcomponents:
+                if comp.name != "VEVENT":
+                    continue
+                ev_uid = str(comp.get("UID", "")).strip()
+                if ev_uid != str(uid).strip():
+                    continue
 
-            updated += 1
+                all_day_event = _is_all_day_component(comp)
 
-        if updated == 0:
-            raise ValueError("No matching UID found to update.")
+                if new_summary is not None:
+                    comp["SUMMARY"] = new_summary
+                if new_start_val is not None and comp.get("DTSTART") is not None:
+                    comp["DTSTART"].dt = (
+                        _coerce_date(new_start_val)
+                        if all_day_event
+                        else _coerce_local_floating_dt(new_start_val)
+                    )
+                if new_end_val is not None:
+                    if all_day_event:
+                        updated_start_raw = _ical_property_value(comp.get("DTSTART"))
+                        if not isinstance(updated_start_raw, date) or isinstance(
+                            updated_start_raw, datetime
+                        ):
+                            raise ServiceValidationError("All-day event DTSTART must be a date.")
+                        new_end = _coerce_all_day_end(new_end_val, updated_start_raw)
+                    else:
+                        new_end = _coerce_local_floating_dt(new_end_val)
+                    if comp.get("DTEND") is not None:
+                        comp["DTEND"].dt = new_end
+                if (
+                    new_end_val is not None
+                    and comp.get("DTEND") is None
+                    and comp.get("DTSTART") is not None
+                ):
+                    try:
+                        comp["DTEND"] = new_end
+                        if comp.get("DURATION") is not None:
+                            del comp["DURATION"]
+                    except Exception:
+                        pass
+                if new_loc is not None:
+                    comp["LOCATION"] = new_loc
+                if new_desc is not None:
+                    comp["DESCRIPTION"] = new_desc
+                if rrule_raw:
+                    from icalendar import vRecur
 
-        await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
-        await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
+                    rr = rrule_raw
+                    if rr.upper().startswith("RRULE:"):
+                        rr = rr.split(":", 1)[1].strip()
+                    try:
+                        comp["RRULE"] = vRecur.from_ical(rr)
+                    except Exception as e:
+                        raise ServiceValidationError(f"Invalid RRULE: {rr}") from e
+                elif "rrule" in call.data:
+                    try:
+                        if comp.get("RRULE") is not None:
+                            del comp["RRULE"]
+                    except Exception:
+                        pass
+
+                updated += 1
+
+                updated_start = _dt_from_ical(comp.get("DTSTART"))
+                updated_end = _event_end_dt(comp)
+                if (
+                    updated_start is not None
+                    and updated_end is not None
+                    and updated_end <= updated_start
+                ):
+                    raise ServiceValidationError("Updated event end must be after start.")
+
+            if updated == 0:
+                raise ServiceValidationError("No matching UID found to update.")
+
+            await hass.async_add_executor_job(_write_icalendar_atomic, path, cal)
+            await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
 
     async def handle_list(call: ServiceCall) -> dict[str, Any]:
-        cal_ent = call.data.get("calendar")
-        if not cal_ent:
-            raise ValueError("calendar is required")
+        cal_ent = call.data["calendar"]
 
         start_val = call.data.get("start")
         end_val = call.data.get("end")
@@ -582,7 +533,7 @@ def _register_services(hass: HomeAssistant) -> None:
         start_filter = _coerce_dt(start_val) if start_val is not None else None
         end_filter = _coerce_dt(end_val) if end_val is not None else None
 
-        path = _find_ics_path_for_calendar(hass, cal_ent)
+        path = await _find_ics_path_for_calendar(hass, cal_ent)
         cal = await hass.async_add_executor_job(_load_icalendar, path)
 
         events: list[dict[str, Any]] = []
@@ -593,11 +544,24 @@ def _register_services(hass: HomeAssistant) -> None:
             start_dt = _dt_from_ical(comp.get("DTSTART"))
             end_dt = _event_end_dt(comp)
 
-            if start_filter and end_dt and dt_util.as_local(end_dt) < dt_util.as_local(start_filter):
+            if (
+                start_filter
+                and end_dt
+                and dt_util.as_local(end_dt) < dt_util.as_local(start_filter)
+            ):
                 continue
-            if start_filter and not end_dt and start_dt and dt_util.as_local(start_dt) < dt_util.as_local(start_filter):
+            if (
+                start_filter
+                and not end_dt
+                and start_dt
+                and dt_util.as_local(start_dt) < dt_util.as_local(start_filter)
+            ):
                 continue
-            if end_filter and start_dt and dt_util.as_local(start_dt) > dt_util.as_local(end_filter):
+            if (
+                end_filter
+                and start_dt
+                and dt_util.as_local(start_dt) > dt_util.as_local(end_filter)
+            ):
                 continue
 
             start_raw = getattr(comp.get("DTSTART"), "dt", None)
@@ -605,7 +569,8 @@ def _register_services(hass: HomeAssistant) -> None:
                 "uid": str(comp.get("UID", "")).strip(),
                 "summary": str(comp.get("SUMMARY", "")),
                 "start": _iso_ical_value(comp.get("DTSTART")),
-                "end": _iso_ical_value(comp.get("DTEND")) or (end_dt.isoformat() if end_dt else None),
+                "end": _iso_ical_value(comp.get("DTEND"))
+                or (end_dt.isoformat() if end_dt else None),
                 "all_day": isinstance(start_raw, date) and not isinstance(start_raw, datetime),
                 "description": str(comp.get("DESCRIPTION", "")),
                 "location": str(comp.get("LOCATION", "")),
@@ -619,31 +584,108 @@ def _register_services(hass: HomeAssistant) -> None:
 
         return {"calendar": cal_ent, "count": len(events), "events": events}
 
+    async def handle_import(call: ServiceCall) -> None:
+        cal_ent = call.data["calendar"]
+        clear_existing_events = bool(call.data.get("clear_existing_events", False))
+        raw_ics = call.data["ics"]
+
+        path = await _find_ics_path_for_calendar(hass, cal_ent)
+        (
+            imported_timezones,
+            imported_events,
+            imported_event_uids,
+        ) = await hass.async_add_executor_job(_load_import_icalendar, raw_ics)
+
+        async with _ics_file_lock(hass, path):
+            before_mtime = await _async_get_mtime(hass, path)
+
+            cal = await hass.async_add_executor_job(_load_icalendar, path)
+
+            from icalendar import Calendar
+
+            new_cal = Calendar()
+            for key, value in cal.items():
+                new_cal.add(key, value)
+
+            existing_event_uids: set[str] = set()
+            existing_timezones: set[str] = set()
+
+            for component in cal.subcomponents:
+                if component.name == "VEVENT":
+                    existing_uid = str(component.get("UID", "")).strip()
+                    if existing_uid:
+                        existing_event_uids.add(existing_uid)
+                    if clear_existing_events:
+                        continue
+                elif component.name == "VTIMEZONE":
+                    tzid = _component_tzid(component)
+                    if tzid:
+                        existing_timezones.add(tzid)
+
+                new_cal.add_component(component)
+
+            duplicate_uids = (
+                sorted(imported_event_uids & existing_event_uids)
+                if not clear_existing_events
+                else []
+            )
+            if duplicate_uids:
+                raise ServiceValidationError(
+                    "Imported ICS content contains UID values that already exist "
+                    "in the selected calendar: "
+                    + ", ".join(duplicate_uids[:5])
+                    + ("..." if len(duplicate_uids) > 5 else "")
+                )
+
+            for component in imported_timezones:
+                tzid = _component_tzid(component)
+                if tzid and tzid in existing_timezones:
+                    continue
+                new_cal.add_component(component)
+                if tzid:
+                    existing_timezones.add(tzid)
+
+            for component in imported_events:
+                new_cal.add_component(component)
+
+            await hass.async_add_executor_job(_write_icalendar_atomic, path, new_cal)
+            await _force_refresh_after_edit(hass, cal_ent, path, before_mtime)
+
     hass.services.async_register(
         DOMAIN,
-        "add_event",
-        handle_add,
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "delete_event",
-        handle_delete,
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "update_event",
-        handle_update,
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "list_events",
+        SERVICE_LIST_EVENTS,
         handle_list,
+        schema=LIST_EVENTS_SCHEMA,
         supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ADD_EVENT,
+        handle_add,
+        schema=ADD_EVENT_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_EVENT,
+        handle_update,
+        schema=UPDATE_EVENT_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DELETE_EVENT,
+        handle_delete,
+        schema=DELETE_EVENT_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_IMPORT_EVENTS,
+        handle_import,
+        schema=IMPORT_EVENTS_SCHEMA,
     )
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
-    # No YAML required. Services will be registered when the config entry is created.
+    # YAML configuration is not supported; services are registered from config entry setup.
     return True
 
 
